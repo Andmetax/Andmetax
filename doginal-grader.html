@@ -254,7 +254,6 @@ async function loadFromFirestore() {
   if(!db) return [];
   try {
     const snapshot = await db.collection(SLABS_COLLECTION)
-      .orderBy('savedAt', 'desc')
       .limit(100)
       .get();
     return snapshot.docs.map(doc => ({id: doc.id, ...doc.data()}));
@@ -930,3 +929,4 @@ function roundRect(ctx, x, y, w, h, r) {
 
 </body>
 </html>
+
