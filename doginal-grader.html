@@ -242,12 +242,18 @@ function initFirebase() {
 async function uploadImageToStorage(base64DataUrl, certId) {
   if(!storage) return null;
   try {
-    // Convert base64 to blob
-    const res = await fetch(base64DataUrl);
-    const blob = await res.blob();
+    // Convert base64 to blob without fetch
+    const base64 = base64DataUrl.split(',')[1];
+    const binary = atob(base64);
+    const array = new Uint8Array(binary.length);
+    for(let i = 0; i < binary.length; i++) array[i] = binary.charCodeAt(i);
+    const blob = new Blob([array], {type: 'image/jpeg'});
     const ref = storage.ref('slabs/' + certId + '.jpg');
-    await ref.put(blob, {contentType: 'image/jpeg'});
-    const url = await ref.getDownloadURL();
+    const snapshot = await Promise.race([
+      ref.put(blob, {contentType: 'image/jpeg'}),
+      new Promise((_,reject) => setTimeout(() => reject(new Error('upload timeout')), 15000))
+    ]);
+    const url = await snapshot.ref.getDownloadURL();
     return url;
   } catch(e) {
     console.error('Storage upload error:', e);
@@ -454,27 +460,25 @@ async function saveToVault(){
   if(!generatedCard)return;
   const btn=document.getElementById('saveBtn');
   btn.textContent='⟳ UPLOADING...';btn.disabled=true;
+  
+  // Always save locally first instantly
+  vaultCards=[generatedCard,...vaultCards];
+  saveVaultData(vaultCards);
+  updateWallCount();
+
   try {
-    // Save to Firestore + Storage (community vault)
-    const saved = await saveToFirestore(generatedCard);
-    // Also save locally
-    vaultCards=[generatedCard,...vaultCards];
-    saveVaultData(vaultCards);
-    updateWallCount();
-    if(saved){
-      showToast('🏛 SAVED TO COMMUNITY VAULT!');
-    } else {
-      showToast('🏛 SAVED LOCALLY!');
-    }
-    setTimeout(()=>switchPage('wall'),1200);
+    // Try Firebase with 20 second total timeout
+    const saved = await Promise.race([
+      saveToFirestore(generatedCard),
+      new Promise((_,reject) => setTimeout(() => reject(new Error('timeout')), 20000))
+    ]);
+    showToast(saved ? '🏛 SAVED TO COMMUNITY VAULT!' : '🏛 SAVED LOCALLY!');
   } catch(e) {
-    vaultCards=[generatedCard,...vaultCards];
-    saveVaultData(vaultCards);
-    updateWallCount();
     showToast('🏛 SAVED LOCALLY!');
-    setTimeout(()=>switchPage('wall'),1200);
   }
+  
   btn.textContent='🏛 SAVE TO VAULT WALL';btn.disabled=false;
+  setTimeout(()=>switchPage('wall'),1200);
 }
 
 function setFilter(f,btn){
