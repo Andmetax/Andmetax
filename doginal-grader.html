@@ -95,6 +95,7 @@ footer p{font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);let
 </style>
 <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-storage-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 </head>
 <body>
@@ -223,22 +224,45 @@ const firebaseConfig = {
     messagingSenderId: "944555601905",
     appId: "1:944555601905:web:2f8be3b4fe703d77da1e50"
   };
-let db = null;
+let db = null, storage = null;
 const SLABS_COLLECTION = 'slabs';
+
 function initFirebase() {
   try {
     if(typeof firebase !== 'undefined') {
       firebase.initializeApp(firebaseConfig);
       db = firebase.firestore();
-      console.log('Firebase ready');
+      storage = firebase.storage();
+      console.log('Firebase + Storage ready');
     }
   } catch(e) { console.log('Firebase init error:', e); }
+}
+
+// Upload image to Firebase Storage, return download URL
+async function uploadImageToStorage(base64DataUrl, certId) {
+  if(!storage) return null;
+  try {
+    // Convert base64 to blob
+    const res = await fetch(base64DataUrl);
+    const blob = await res.blob();
+    const ref = storage.ref('slabs/' + certId + '.jpg');
+    await ref.put(blob, {contentType: 'image/jpeg'});
+    const url = await ref.getDownloadURL();
+    return url;
+  } catch(e) {
+    console.error('Storage upload error:', e);
+    return null;
+  }
 }
 
 async function saveToFirestore(card) {
   if(!db) return false;
   try {
+    // Strip base64 image, upload to Storage instead
+    const imageUrl = await uploadImageToStorage(card.image, card.certId);
     const cardToSave = Object.assign({}, card);
+    delete cardToSave.image; // remove heavy base64
+    cardToSave.imageUrl = imageUrl || ''; // store tiny URL instead
     await db.collection(SLABS_COLLECTION).add({
       ...cardToSave,
       savedAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -253,10 +277,13 @@ async function saveToFirestore(card) {
 async function loadFromFirestore() {
   if(!db) return [];
   try {
-    const snapshot = await db.collection(SLABS_COLLECTION)
-      .limit(100)
-      .get();
-    return snapshot.docs.map(doc => ({id: doc.id, ...doc.data()}));
+    const snapshot = await db.collection(SLABS_COLLECTION).limit(100).get();
+    return snapshot.docs.map(doc => {
+      const data = {id: doc.id, ...doc.data()};
+      // Use imageUrl from Storage if no local base64 image
+      if(!data.image && data.imageUrl) data.image = data.imageUrl;
+      return data;
+    });
   } catch(e) {
     console.error('Firestore load error:', e);
     return [];
@@ -423,18 +450,31 @@ function switchTheme(name){
   showToast(th.icon+' SWITCHED TO '+th.name);
 }
 
-function saveToVault(){
+async function saveToVault(){
   if(!generatedCard)return;
   const btn=document.getElementById('saveBtn');
-  btn.textContent='⟳ SAVING...';btn.disabled=true;
-  setTimeout(()=>{
+  btn.textContent='⟳ UPLOADING...';btn.disabled=true;
+  try {
+    // Save to Firestore + Storage (community vault)
+    const saved = await saveToFirestore(generatedCard);
+    // Also save locally
     vaultCards=[generatedCard,...vaultCards];
-    const ok=saveVaultData(vaultCards);
+    saveVaultData(vaultCards);
     updateWallCount();
-    if(ok){showToast('🏛 SAVED TO VAULT!');setTimeout(()=>switchPage('wall'),1200);}
-    else showToast('⚠️ STORAGE FULL — TRY SMALLER IMAGE');
-    btn.textContent='🏛 SAVE TO VAULT WALL';btn.disabled=false;
-  },400);
+    if(saved){
+      showToast('🏛 SAVED TO COMMUNITY VAULT!');
+    } else {
+      showToast('🏛 SAVED LOCALLY!');
+    }
+    setTimeout(()=>switchPage('wall'),1200);
+  } catch(e) {
+    vaultCards=[generatedCard,...vaultCards];
+    saveVaultData(vaultCards);
+    updateWallCount();
+    showToast('🏛 SAVED LOCALLY!');
+    setTimeout(()=>switchPage('wall'),1200);
+  }
+  btn.textContent='🏛 SAVE TO VAULT WALL';btn.disabled=false;
 }
 
 function setFilter(f,btn){
@@ -451,7 +491,10 @@ async function renderWall(){
   // Load from Firestore (shared) + local
   let firestoreCards = [];
   try {
-    firestoreCards = await loadFromFirestore();
+    firestoreCards = await Promise.race([
+      loadFromFirestore(),
+      new Promise((_,reject) => setTimeout(() => reject(new Error('timeout')), 4000))
+    ]);
   } catch(e) {
     console.log('Firestore unavailable, using local');
   }
@@ -569,66 +612,69 @@ function downloadSlab() {
   
   // Use scale 4 for 4K quality
   renderSlabToCanvas(4, function(canvas) {
-    // Add padding/background for a beautiful standalone card
+    // Square canvas so full slab shows when posted on X
+    var SIZE = Math.max(canvas.width, canvas.height) + 160;
     var padded = document.createElement('canvas');
-    var pad = 80;
-    padded.width = canvas.width + pad*2;
-    padded.height = canvas.height + pad*2 + 160;
+    padded.width = SIZE;
+    padded.height = SIZE;
     var ctx = padded.getContext('2d');
     
     // Background gradient
-    var grad = ctx.createLinearGradient(0, 0, padded.width, padded.height);
+    var grad = ctx.createLinearGradient(0, 0, SIZE, SIZE);
     grad.addColorStop(0, '#020510');
     grad.addColorStop(0.5, '#050810');
     grad.addColorStop(1, '#020510');
     ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, padded.width, padded.height);
+    ctx.fillRect(0, 0, SIZE, SIZE);
     
     // Grid lines
     ctx.strokeStyle = 'rgba(0,229,255,0.04)';
     ctx.lineWidth = 1;
     var gridSize = 40 * 4;
-    for(var x=0; x<padded.width; x+=gridSize){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,padded.height); ctx.stroke(); }
-    for(var y=0; y<padded.height; y+=gridSize){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(padded.width,y); ctx.stroke(); }
+    for(var x=0; x<SIZE; x+=gridSize){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,SIZE); ctx.stroke(); }
+    for(var y=0; y<SIZE; y+=gridSize){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(SIZE,y); ctx.stroke(); }
     
     // Glow behind slab
-    var cx = padded.width/2, cy = pad + canvas.height/2;
+    var cx = SIZE/2, cy = SIZE/2;
     var themeColors = {'GOLD LUXURY':'255,215,0','EMERALD NATURE':'0,204,68','ICE FROST':'0,212,255','FIRE LEGENDARY':'255,69,0','WIZARD MYSTIC':'130,0,255','COSMIC GALAXY':'68,68,255','RUBY FIRE':'255,0,102','DIAMOND ELITE':'100,180,255','PLATINUM':'200,200,200','RAINBOW PRISM':'255,136,255','ONYX SHADOW':'100,100,100','AURORA':'0,204,170'};
-    var rgb = themeColors[generatedCard.themeName] || '255,215,0';
-    var glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, canvas.width*0.7);
+    var rgb = themeColors[generatedCard.theme ? generatedCard.theme.name : ''] || '255,215,0';
+    var glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, SIZE*0.6);
     glowGrad.addColorStop(0, 'rgba('+rgb+',.15)');
     glowGrad.addColorStop(0.5, 'rgba('+rgb+',.05)');
     glowGrad.addColorStop(1, 'rgba('+rgb+',0)');
     ctx.fillStyle = glowGrad;
-    ctx.fillRect(0, 0, padded.width, padded.height);
+    ctx.fillRect(0, 0, SIZE, SIZE);
     
-    // Draw slab
-    ctx.drawImage(canvas, pad, pad);
+    // Center slab on square canvas
+    var slabX = Math.round((SIZE - canvas.width) / 2);
+    var slabY = Math.round((SIZE - canvas.height) / 2) - 40;
+    ctx.drawImage(canvas, slabX, slabY);
     
     // Bottom branding
-    var brandY = pad + canvas.height + 40;
+    var brandY = slabY + canvas.height + 20;
     ctx.textAlign = 'center';
     
     // Title
-    ctx.font = 'bold '+(28*4)+'px "Orbitron", monospace';
+    ctx.font = 'bold '+(18*4)+'px "Orbitron", monospace';
     ctx.fillStyle = '#FFD700';
     ctx.shadowColor = 'rgba(255,215,0,0.6)';
     ctx.shadowBlur = 20*4;
-    ctx.fillText('DOGINAL DOG GRADER', padded.width/2, brandY + 40*4);
+    ctx.fillText('DOGINAL DOG GRADER', SIZE/2, brandY + 20*4);
     
-    ctx.font = (11*4)+'px "Orbitron", monospace';
+    ctx.font = (9*4)+'px "Orbitron", monospace';
     ctx.fillStyle = 'rgba(0,229,255,0.8)';
     ctx.shadowColor = 'rgba(0,229,255,0.4)';
     ctx.shadowBlur = 10*4;
-    ctx.fillText('CERTIFIED GEM MINT 10 · DOGECOIN BLOCKCHAIN', padded.width/2, brandY + 65*4);
+    ctx.fillText('CERTIFIED GEM MINT 10 · DOGECOIN', SIZE/2, brandY + 38*4);
     
     ctx.shadowBlur = 0;
-    ctx.font = (9*4)+'px "Space Mono", monospace';
+    ctx.font = (8*4)+'px "Space Mono", monospace';
     ctx.fillStyle = 'rgba(255,255,255,0.3)';
-    ctx.fillText('andmetax.github.io/Andmetax', padded.width/2, brandY + 88*4);
+    ctx.fillText('andmetax.github.io/Andmetax', SIZE/2, brandY + 54*4);
     
     // Download
     padded.toBlob(function(blob) {
+
       var url = URL.createObjectURL(blob);
       var a = document.createElement('a');
       a.href = url;
